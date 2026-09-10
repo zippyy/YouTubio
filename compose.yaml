@@ -1,0 +1,11 @@
+services:
+  youtubio:
+    build: .
+    container_name: youtubio
+    restart: unless-stopped
+    ports:
+      - "7000:7000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/usr/src/app/data

@@ -7,6 +7,31 @@ const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
 const cache = new (require('node-cache'))({ stdTTL: process.env.TTL ?? 3600, useClones: false });  // Cache for 1 hour
+const fsSync = require('fs');
+const CONFIG_DIR = process.env.CONFIG_DIR ?? path.join(__dirname, 'data', 'configs');
+/** @type {Map<string, Object>} */
+const configStore = new Map();
+
+/** Load all stored configs from disk into memory (called once at boot). */
+function loadConfigStore() {
+    try {
+        const files = fsSync.readdirSync(CONFIG_DIR).filter(f => f.endsWith('.json'));
+        for (const f of files) {
+            try {
+                configStore.set(f.slice(0, -5), JSON.parse(fsSync.readFileSync(path.join(CONFIG_DIR, f), 'utf8')));
+            } catch (error) { logError(error); }
+        }
+    } catch (error) { /* directory may not exist yet */ }
+}
+
+/** Persist a config object and return a short unguessable id. */
+function saveConfigToStore(configObj) {
+    fsSync.mkdirSync(CONFIG_DIR, { recursive: true });
+    const id = crypto.randomBytes(8).toString('hex');
+    fsSync.writeFileSync(path.join(CONFIG_DIR, id + '.json'), JSON.stringify(configObj));
+    configStore.set(id, configObj);
+    return id;
+}
 // const util = require('util');
 
 const tmpdir = require('os').tmpdir();
@@ -112,14 +137,13 @@ async function runYtDlpWithAuth(url, encryptedConfig, argsArray) {
             '--js-runtimes', 'node',
             '-i',
             '--no-plugin-dirs',
-            '--flat-playlist',
+            ...(argsArray.includes('--resolve-full') ? ['--no-flat-playlist'] : ['--flat-playlist']),
             '--no-cache-dir',
             '--no-warnings',
             '--ignore-no-formats-error',
             '-J',
             '--ies', process.env.YTDLP_EXTRACTORS ?? 'all',
             '--extractor-args', 'generic:impersonate',
-            '--compat-options', 'no-youtube-channel-redirect',
             ...(cookies ? ['--cookies', filename] : [])
         ]));
         if (canCache) cache.set(cacheKey, r);
@@ -326,6 +350,7 @@ function cutM3U8(body, ranges = [], overestimate = false) {
 }
 
 const app = express();
+app.use((req, res, next) => { console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`); next(); });
 app.set('trust proxy', true);
 
 app.use(express.urlencoded({ extended: true }));
@@ -377,6 +402,17 @@ app.post('/encrypt', (req, res, next) => {
     }
 });
 
+// Config Store Endpoint (short-url configs)
+app.post('/api/config', (req, res, next) => {
+    try {
+        const id = saveConfigToStore(req.body ?? {});
+        return res.json({ id });
+    } catch (error) {
+        res.status(500).json({ error: 'Config save failed' });
+        return next(error);
+    }
+});
+
 // Get YouTube Playlists Endpoint
 app.get('/:config/playlists', async (req, res, next) => {
     try {
@@ -409,7 +445,15 @@ function logError(error) {
  */
 function decryptConfig(encryptedConfig, enableDecryption = true) {
     /** @type {Object} */
-    const config = typeof encryptedConfig === 'string' ? JSON.parse(encryptedConfig) : encryptedConfig;
+    let config;
+    if (typeof encryptedConfig === 'string' && !encryptedConfig.startsWith('{')) {
+        // Short server-side config id (new format). Unknown ids throw; the
+        // caller's catch turns them into an empty response, not a crash.
+        config = JSON.parse(JSON.stringify(configStore.get(encryptedConfig)));
+        if (!config) throw new Error(`Unknown config id: ${encryptedConfig}`);
+    } else {
+        config = typeof encryptedConfig === 'string' ? JSON.parse(encryptedConfig) : encryptedConfig;
+    }
     if (enableDecryption && config.encrypted && typeof config.encrypted === 'string') {
         try {
             config.encrypted = JSON.parse(decrypt(config.encrypted));
@@ -544,7 +588,7 @@ function toYouTubeURL(userConfig, videoId, query) {
             'Rating': 'CAESAhAB'
         }[genre]}`;
     else if (catalogConfig.channelType === 'channel' || videoId === ':ytsearch:channel')
-        return `https://www.youtube.com/results?search_query=${encodeURIComponent(query.search ?? '')}&sp=${{
+        return `https://www.youtube.com/results?search_query=${encodeURIComponent(query.search ?? (videoId.startsWith(prefix) ? videoId.slice(prefix.length) : videoId))}&sp=${{
             'Relevance': 'CAASAhAC',
             'Upload Date': 'CAISAhAC',
             'View Count': 'CAMSAhAC',
@@ -651,19 +695,41 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res, next) => {
         const userConfig = decryptConfig(req.params.config, false);
         const query = Object.fromEntries(new URLSearchParams(req.params.extra ?? ''));
         const skip = parseInt(query.skip ?? 0);
-        const url = toYouTubeURL(userConfig, req.params.id, query);
-        const videos = await runYtDlpWithAuth(url, req.params.config, [
-            '-I', query.genre?.startsWith(reversedPrefix) ? `${-(skip + 1)}:${-(skip + 100)}:-1` : `${skip + 1}:${skip + 100}:1`,
-            '--yes-playlist'
-        ]);
+        let url = toYouTubeURL(userConfig, req.params.id, query);
+        let videos;
+        const isChannelTab = /\/(videos|streams|shorts)$/.test(url);
+        try {
+            videos = await runYtDlpWithAuth(url, req.params.config, [
+                '-I', query.genre?.startsWith(reversedPrefix) ? `${-(skip + 1)}:${-(skip + 100)}:-1` : `${skip + 1}:${skip + 100}:1`,
+                '--yes-playlist',
+                ...(isChannelTab ? ['--resolve-full'] : [])
+            ]);
+        } catch (e) {
+            if (/\/videos$/.test(url)) {
+                url = url.replace(/\/videos$/, '/streams');
+                videos = await runYtDlpWithAuth(url, req.params.config, [
+                    '-I', query.genre?.startsWith(reversedPrefix) ? `${-(skip + 1)}:${-(skip + 100)}:-1` : `${skip + 1}:${skip + 100}:1`,
+                    '--yes-playlist'
+                ]);
+            } else throw e;
+        }
+        if ((videos._type === 'playlist' && !(videos.entries ?? []).length) || (!videos.entries && !videos.id && /\/videos$/.test(url))) {
+            url = url.replace(/\/videos$/, '/streams');
+            videos = await runYtDlpWithAuth(url, req.params.config, [
+                '-I', query.genre?.startsWith(reversedPrefix) ? `${-(skip + 1)}:${-(skip + 100)}:-1` : `${skip + 1}:${skip + 100}:1`,
+                '--yes-playlist'
+            ]);
+        }
         const useID = videos.webpage_url_domain === 'youtube.com';
         const playlist = videos._type === 'playlist';
         const ref = req.get('Referrer');
         const protocol = ref ? ref + '#' : 'stremio://';
         const canCache = [channelRegex, channelIDRegex, playlistIDRegex, videoIDRegex].map(r => r.test(url)).some(Boolean);
+        const entries = (playlist ? videos.entries : [videos])
+            .filter(video => !(video.live_status === 'is_upcoming'));
         return res.json({
             metas: (await Promise.all(
-                (playlist ? videos.entries : [videos])
+                entries
                     .map(video => parseMeta(userConfig, video, toManifestURL(req), protocol, useID, req.params.id, playlist, req.params.type))
             )).filter(meta => meta !== null),
             behaviorHints: { cacheMaxAge: canCache ? process.env.TTL ?? 3600 : 0 }
@@ -1394,7 +1460,7 @@ app.get(['/', '/:config?/configure'], async (req, res) => {
                             id: ${JSON.stringify(prefix)} + pl.id,
                             ...(pl.sortOrder?.length ? { sortOrder: pl.sortOrder } : {})
                         }));
-                        const configString = \`://${req.get('host')}/\${encodeURIComponent(JSON.stringify({
+                        const configObj = {
                             ...(cookies.value ? {encrypted: cookies.value} : {}),
                             ...(modifiedPlaylists.length ? { catalogs: modifiedPlaylists } : {}),
                             // Non-Sensitive Settings
@@ -1409,7 +1475,14 @@ app.get(['/', '/:config?/configure'], async (req, res) => {
                                         return value != x.dataset.default ? [x.name, value] : null;
                                     }).filter(x => x !== null)
                             )
-                        }))}/\`;
+                        };
+                        // Store the config server-side; keep the install URL short
+                        const configId = await (await fetch('/api/config', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(configObj)
+                        })).json();
+                        const configString = \`://${req.get('host')}/\${configId.id}/\`;
                         const protocol = ${JSON.stringify(req.protocol)};
                         const manifestString = configString + 'manifest.json';
                         installStremio.href = 'stremio' + manifestString;
@@ -1445,6 +1518,7 @@ app.use((err, req, res, next) => {
 });
 
 // Start the Server
+loadConfigStore();
 app.listen(PORT, () => {
     console.log(`Addon server v${VERSION} running on port ${PORT}`);
     if (!process.env.ENCRYPTION_KEY) {
