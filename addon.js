@@ -392,6 +392,30 @@ app.get('/stream/:url', async (req, res, next) => {
     }
 });
 
+// Mux Proxy: merge best video + best audio into one stream via yt-dlp+ffmpeg
+const { spawn } = require('child_process');
+app.get('/mux/:id', (req, res, next) => {
+    const videoId = req.params.id;
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const args = [
+        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+        '--merge-output-format', 'mp4',
+        '-o', '-',
+        '--no-warnings', '--no-cache-dir', '--no-playlist',
+        '--extractor-args', 'generic:impersonate',
+        videoUrl
+    ];
+    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    res.set('Content-Type', 'video/mp4');
+    res.set('Cache-Control', 'no-cache');
+    let errBuf = '';
+    proc.stderr.on('data', d => { errBuf += d.toString(); });
+    proc.stdout.pipe(res);
+    proc.on('error', e => { if (!res.headersSent) res.status(500).send('Mux failed'); next(e); });
+    proc.on('close', code => { if (code !== 0 && !res.headersSent) res.status(500).send('Mux failed'); });
+    req.on('close', () => { if (!res.writableEnded) proc.kill(); });
+});
+
 // Config Encryption Endpoint
 app.post('/encrypt', (req, res, next) => {
     try {
@@ -749,6 +773,7 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res, next) => {
  * @returns {Promise<Array<Object>>}
  */
 async function parseStream(userConfig, video, manifestUrl, protocol, reqProtocol, reqHost) {
+    if (!video || typeof video !== 'object') return [];
     let ranges = [];
     try {
         if (videoIDRegex.test(video.id))
@@ -759,6 +784,12 @@ async function parseStream(userConfig, video, manifestUrl, protocol, reqProtocol
     const rangesURI = ranges.length ? encodeURIComponent(JSON.stringify(ranges)) : null;
     const useID = video.webpage_url_domain === 'youtube.com';
     return [
+        ...(useID && videoIDRegex.test(video.id) ? [{
+            name: 'YT-DLP Muxed (A+V)',
+            url: `${reqProtocol}://${reqHost}/mux/${video.id}`,
+            description: 'Merged video+audio stream',
+            behaviorHints: { bingeGroup: 'YT-DLP Muxed', notWebReady: true }
+        }] : []),
         ...(video.formats ?? [video]).filter(src => ((userConfig.showBrokenLinks ?? defaultConfig.showBrokenLinks) || (!src.format_id?.startsWith('sb') && src.acodec !== 'none' && src.vcodec !== 'none')) && src.url).toReversed().flatMap(src => {
             const base = {
                 description: src.format,
@@ -904,10 +935,19 @@ app.get('/:config/stream/:type/:id.json', async (req, res, next) => {
     try {
         if (!req.params.id?.startsWith(prefix)) throw new Error(`Unknown ID in Stream handler: "${req.params.id}"`);
         const userConfig = decryptConfig(req.params.config, false);
-        const video = await runYtDlpWithAuth(toYouTubeURL(userConfig, req.params.id, {}), req.params.config, [
+        let video = await runYtDlpWithAuth(toYouTubeURL(userConfig, req.params.id, {}), req.params.config, [
             '-I', ':1',
             '--no-playlist'
         ]);
+        // Flat-playlist returns the playlist object or URL stubs; resolve to a real video.
+        if (video && video._type === 'playlist' && (video.entries ?? []).length) {
+            video = video.entries[0];
+        }
+        if (video && (video._type === 'url' || (!video.formats && video.url))) {
+            video = await runYtDlpWithAuth(video.url, req.params.config, [
+                '--no-playlist'
+            ]);
+        }
         const ref = req.get('Referrer');
         const protocol = ref ? ref + '#' : 'stremio://';
         return res.json({
