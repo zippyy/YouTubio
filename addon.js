@@ -697,12 +697,10 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res, next) => {
         const skip = parseInt(query.skip ?? 0);
         let url = toYouTubeURL(userConfig, req.params.id, query);
         let videos;
-        const isChannelTab = /\/(videos|streams|shorts)$/.test(url);
         try {
             videos = await runYtDlpWithAuth(url, req.params.config, [
                 '-I', query.genre?.startsWith(reversedPrefix) ? `${-(skip + 1)}:${-(skip + 100)}:-1` : `${skip + 1}:${skip + 100}:1`,
                 '--yes-playlist',
-                ...(isChannelTab ? ['--resolve-full'] : [])
             ]);
         } catch (e) {
             if (/\/videos$/.test(url)) {
